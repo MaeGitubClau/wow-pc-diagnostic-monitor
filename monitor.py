@@ -22,8 +22,16 @@ import urllib.request
 import zipfile
 import shutil
 
+import ctypes
 import psutil
 from background_scan import scan_processes
+
+
+def _is_admin():
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 try:
     import pynvml
@@ -41,7 +49,7 @@ except Exception:
     HAS_WMI = False
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-WOW_PROCESS_NAMES = ["Wow.exe", "WowT.exe", "WowB.exe", "WowClassic.exe"]
+WOW_PROCESS_NAMES = {"wow.exe", "wowt.exe", "wowb.exe", "wowclassic.exe"}
 PRESENTMON_EXE    = os.path.join(os.path.dirname(__file__), "PresentMon64.exe")
 PRESENTMON_URL    = "https://github.com/GameTechDev/PresentMon/releases/download/v1.10.0/PresentMon-1.10.0-x64.exe"
 FPS_HISTORY_LEN   = 300   # keep last 5 min of FPS samples
@@ -112,18 +120,31 @@ class FPSCapture:
 
     def _find_wow(self):
         for proc in psutil.process_iter(["pid", "name"]):
-            if proc.info["name"] in WOW_PROCESS_NAMES:
+            if (proc.info["name"] or "").lower() in WOW_PROCESS_NAMES:
                 return proc.info["pid"], proc.info["name"]
         return None, None
 
     def _ensure_presentmon(self):
         if os.path.exists(PRESENTMON_EXE):
-            return True
-        # Try to download it
+            if os.path.getsize(PRESENTMON_EXE) < 50_000:
+                # Corrupt/incomplete previous download — delete and retry
+                os.remove(PRESENTMON_EXE)
+            else:
+                return True
+        if not _is_admin():
+            self._status = (
+                "⚠ NOT RUNNING AS ADMIN — FPS capture requires admin rights.\n"
+                "Right-click run.bat → Run as Administrator, then restart."
+            )
+            return False
         try:
-            self._status = "Downloading PresentMon…"
+            self._status = "Downloading PresentMon (one-time, ~2 MB)…"
             tmp = PRESENTMON_EXE + ".tmp"
             urllib.request.urlretrieve(PRESENTMON_URL, tmp)
+            if os.path.getsize(tmp) < 50_000:
+                os.remove(tmp)
+                self._status = "PresentMon download failed — file too small (network error?)"
+                return False
             shutil.move(tmp, PRESENTMON_EXE)
             return True
         except Exception as e:
@@ -170,10 +191,21 @@ class FPSCapture:
         self._proc = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             text=True,
             bufsize=1,
         )
+        # Drain stderr in background so it doesn't block and we can show errors
+        def _drain_stderr():
+            lines = []
+            for line in self._proc.stderr:
+                line = line.strip()
+                if line:
+                    lines.append(line)
+                    self._status = f"PresentMon: {line}"
+            if lines and self._current_fps is None:
+                self._status = f"PresentMon error: {lines[-1]}"
+        threading.Thread(target=_drain_stderr, daemon=True).start()
 
         header = None
         col_ms = None
@@ -875,7 +907,11 @@ class Monitor(tk.Tk):
             fg=color_val(cpu["disk_pct"], 80, 90))
 
     def _refresh_fps(self, fps):
-        self.r_fps_status.config(text=fps["status"], fg=DIM)
+        status = fps["status"]
+        status_color = CRIT if ("NOT RUNNING AS ADMIN" in status or "error" in status.lower()) \
+                       else WARN if "failed" in status.lower() \
+                       else DIM
+        self.r_fps_status.config(text=status, fg=status_color)
         if fps["fps"] is not None:
             f = fps["fps"]
             avg = fps["avg"] or f
