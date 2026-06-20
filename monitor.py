@@ -23,6 +23,7 @@ import zipfile
 import shutil
 
 import psutil
+from background_scan import scan_processes
 
 try:
     import pynvml
@@ -476,17 +477,24 @@ class Monitor(tk.Tk):
         t_live = tk.Frame(nb, bg=BG)
         t_fps  = tk.Frame(nb, bg=BG)
         t_prob = tk.Frame(nb, bg=BG)
+        t_bg   = tk.Frame(nb, bg=BG)
         t_log  = tk.Frame(nb, bg=BG)
 
         nb.add(t_live, text="  Live Stats  ")
         nb.add(t_fps,  text="  FPS Monitor  ")
         nb.add(t_prob, text="  Problems  ")
+        nb.add(t_bg,   text="  Background  ")
         nb.add(t_log,  text="  Log  ")
 
         self._build_live(t_live)
         self._build_fps(t_fps)
         self._build_problems(t_prob)
+        self._build_background(t_bg)
         self._build_log(t_log)
+
+        self._bg_scan_result = {}
+        self._bg_scan_lock   = threading.Lock()
+        self._last_bg_scan   = 0
 
         bot = tk.Frame(self, bg=PANEL, pady=6)
         bot.pack(fill="x", side="bottom")
@@ -601,6 +609,122 @@ class Monitor(tk.Tk):
                                   fg=GOOD, bg=BG, font=self._mono_b)
         self._no_prob.pack(pady=30)
 
+    # ── Background tab ─────────────────────────────────────────────────────────
+
+    def _build_background(self, p):
+        hdr = tk.Frame(p, bg=BG)
+        hdr.pack(fill="x", padx=10, pady=(10, 0))
+        tk.Label(hdr, text="Background Process Scanner",
+                 fg=HEADER, bg=BG, font=self._big).pack(side="left")
+        self._bg_scan_btn = tk.Button(
+            hdr, text="⟳ Scan Now",
+            command=self._trigger_bg_scan,
+            bg=ACCENT, fg=WHITE, font=self._mono,
+            relief="flat", padx=10, pady=2, cursor="hand2")
+        self._bg_scan_btn.pack(side="right")
+
+        self._bg_power_lbl = tk.Label(
+            p, text="Power plan: checking…",
+            fg=DIM, bg=BG, font=self._mono, anchor="w")
+        self._bg_power_lbl.pack(fill="x", padx=14, pady=(6, 0))
+
+        self._bg_stats_lbl = tk.Label(
+            p, text="",
+            fg=DIM, bg=BG, font=self._h1, anchor="w")
+        self._bg_stats_lbl.pack(fill="x", padx=14)
+
+        self._bg_text = tk.Text(
+            p, bg=PANEL, fg=FG, font=("Consolas", 9),
+            relief="flat", bd=0, state="disabled", wrap="word")
+        sb = ttk.Scrollbar(p, command=self._bg_text.yview)
+        self._bg_text.configure(yscrollcommand=sb.set)
+        self._bg_text.tag_configure("crit",  foreground=CRIT,   font=("Consolas", 9, "bold"))
+        self._bg_text.tag_configure("warn",  foreground=WARN)
+        self._bg_text.tag_configure("info",  foreground=FG)
+        self._bg_text.tag_configure("ok",    foreground=GOOD)
+        self._bg_text.tag_configure("dim",   foreground=DIM)
+        self._bg_text.tag_configure("head",  foreground=HEADER, font=("Consolas", 9, "bold"))
+        sb.pack(side="right", fill="y")
+        self._bg_text.pack(fill="both", expand=True, padx=8, pady=6)
+
+        tk.Label(p, text="Auto-scans every 15s. Flagged = known gaming performance killers.",
+                 fg=DIM, bg=BG, font=self._h1).pack(anchor="w", padx=14, pady=(0, 6))
+
+    def _trigger_bg_scan(self):
+        self._bg_scan_btn.config(text="Scanning…", state="disabled")
+        threading.Thread(target=self._run_bg_scan, daemon=True).start()
+
+    def _run_bg_scan(self):
+        result = scan_processes()
+        with self._bg_scan_lock:
+            self._bg_scan_result = result
+            self._last_bg_scan   = time.time()
+        self.after(0, self._refresh_background, result)
+        self.after(0, lambda: self._bg_scan_btn.config(text="⟳ Scan Now", state="normal"))
+
+    def _refresh_background(self, result):
+        # Power plan
+        pp_sev, pp_msg = result.get("power_plan", ("INFO", "Unknown"))
+        pp_color = CRIT if pp_sev == "CRIT" else WARN if pp_sev == "WARN" else GOOD
+        self._bg_power_lbl.config(
+            text=f"Power Plan: {pp_msg}", fg=pp_color)
+
+        sc = result.get("startup_count")
+        tp = result.get("total_procs", 0)
+        self._bg_stats_lbl.config(
+            text=f"Running processes: {tp}   |   Startup items: {sc if sc else 'N/A'}",
+            fg=WARN if sc and sc > 20 else DIM)
+
+        self._bg_text.configure(state="normal")
+        self._bg_text.delete("1.0", "end")
+
+        flagged = result.get("flagged", [])
+        if not flagged:
+            self._bg_text.insert("end", "✅  No known performance-killing processes detected.\n", "ok")
+        else:
+            crits = [f for f in flagged if f["sev"] == "CRIT"]
+            warns = [f for f in flagged if f["sev"] == "WARN"]
+            infos = [f for f in flagged if f["sev"] == "INFO"]
+
+            if crits:
+                self._bg_text.insert("end", "━━━ 🔴 CRITICAL — Close these before gaming ━━━\n\n", "crit")
+                for p in crits:
+                    self._bg_text.insert("end",
+                        f"  {p['name']}  (PID {p['pid']})  CPU:{p['cpu']:.0f}%  RAM:{p['ram_mb']:.0f}MB\n", "crit")
+                    self._bg_text.insert("end", f"  → {p['reason']}\n\n", "info")
+
+            if warns:
+                self._bg_text.insert("end", "━━━ 🟡 WARNINGS — Recommended to close/configure ━━━\n\n", "warn")
+                for p in warns:
+                    self._bg_text.insert("end",
+                        f"  {p['name']}  (PID {p['pid']})  CPU:{p['cpu']:.0f}%  RAM:{p['ram_mb']:.0f}MB\n", "warn")
+                    self._bg_text.insert("end", f"  → {p['reason']}\n\n", "info")
+
+            if infos:
+                self._bg_text.insert("end", "━━━ ℹ️  INFO — Noted but low impact ━━━\n\n", "head")
+                for p in infos:
+                    self._bg_text.insert("end",
+                        f"  {p['name']}  CPU:{p['cpu']:.0f}%  RAM:{p['ram_mb']:.0f}MB\n", "dim")
+                    self._bg_text.insert("end", f"  → {p['reason']}\n\n", "dim")
+
+        # Top CPU hogs
+        self._bg_text.insert("end", "\n━━━ Top CPU consumers ━━━\n", "head")
+        for px in result.get("top_cpu", []):
+            color = "crit" if px["cpu"] > 20 else "warn" if px["cpu"] > 8 else "dim"
+            self._bg_text.insert("end",
+                f"  {px['cpu']:5.1f}%  {px['name']}\n", color)
+
+        # Top RAM hogs
+        self._bg_text.insert("end", "\n━━━ Top RAM consumers ━━━\n", "head")
+        for px in result.get("top_ram", []):
+            color = "warn" if px["ram_mb"] > 1000 else "dim"
+            self._bg_text.insert("end",
+                f"  {px['ram_mb']:6.0f} MB  {px['name']}\n", color)
+
+        self._bg_text.insert("end",
+            f"\n\nLast scan: {time.strftime('%H:%M:%S')}\n", "dim")
+        self._bg_text.configure(state="disabled")
+
     # ── Log tab ────────────────────────────────────────────────────────────────
 
     def _build_log(self, p):
@@ -620,6 +744,9 @@ class Monitor(tk.Tk):
     # ── Poll loop ──────────────────────────────────────────────────────────────
 
     def _poll_loop(self):
+        # Kick off first background scan immediately in a thread
+        threading.Thread(target=self._run_bg_scan, daemon=True).start()
+
         while self._running:
             t0 = time.time()
             try:
@@ -634,6 +761,10 @@ class Monitor(tk.Tk):
                 if len(self._history) > MAX_HISTORY:
                     self._history.pop(0)
                 uptime = int(time.time() - self._start_t)
+
+                # Re-scan background every 15 seconds
+                if time.time() - self._last_bg_scan > 15:
+                    threading.Thread(target=self._run_bg_scan, daemon=True).start()
                 self.after(0, self._refresh, cpu, gpu, fps_snap, problems, uptime)
             except Exception as e:
                 self.after(0, self._status_lbl.config, {"text": f"Error: {e}"})
